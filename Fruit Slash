@@ -1,0 +1,560 @@
+# file: game/fruit_slash.py
+"""
+Fruit Slash — a PC Fruit Ninja–style game built with Pygame.
+
+Run:
+    pip install pygame
+    python -m game.fruit_slash
+
+Controls:
+    • Hold Left Mouse and swipe to slice.
+    • Avoid slicing bombs.
+    • P — pause/resume
+    • R — restart (from game over)
+    • Esc — quit
+
+Design notes (why):
+    • Uses procedural shapes (no assets) to keep setup zero-dependency beyond pygame.
+    • Segment–circle intersection keeps slicing cheap and robust to fast swipes.
+    • Combo window is tied to a single swipe for satisfying bonus feedback.
+"""
+from __future__ import annotations
+
+import math
+import random
+import sys
+from dataclasses import dataclass, field
+from typing import Deque, Iterable, List, Optional, Sequence, Tuple
+
+import pygame
+from pygame import Color, Rect, Surface, Vector2
+from collections import deque
+
+# -----------------------------
+# Config
+# -----------------------------
+WIDTH, HEIGHT = 960, 540
+FPS = 120
+GRAVITY = 1800.0  # px/s^2
+AIR_DRAG = 0.0008  # proportional drag; stabilizes high-speed objects
+SPAWN_EVERY = (0.9, 1.6)  # seconds (min, max)
+FRUITS_PER_BURST = (1, 4)
+FRUIT_RADIUS = (18, 36)
+FRUIT_SPEED = (850, 1250)
+LAUNCH_X_MARGIN = 120
+BOMB_CHANCE = 0.14  # chance per object spawn
+MAX_TRAIL_POINTS = 24
+TRAIL_KEEP_TIME = 0.14  # seconds
+SLICE_MIN_SPEED = 900.0  # px/s threshold to count as a slicing stroke
+SLICE_THICKNESS = 16  # for visual only
+COMBO_WINDOW_RESET = 0.25  # seconds after last sliced fruit in same swipe
+PARTICLES_PER_SLICE = (14, 22)
+SHAKE_DECAY = 12.0
+
+LIVES_START = 3
+
+random.seed()
+
+# -----------------------------
+# Utilities
+# -----------------------------
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def line_segment_circle_intersect(a: Vector2, b: Vector2, c: Vector2, r: float) -> bool:
+    """Cheap segment–circle test. Stable for fast swipes."""
+    ab = b - a
+    ac = c - a
+    ab_len_sq = ab.x * ab.x + ab.y * ab.y
+    if ab_len_sq <= 1e-6:
+        return ac.length_squared() <= r * r
+    t = clamp(ac.dot(ab) / ab_len_sq, 0.0, 1.0)
+    closest = a + t * ab
+    return (c - closest).length_squared() <= r * r
+
+
+def poly_heart(center: Vector2, size: float, samples: int = 32) -> List[Tuple[int, int]]:
+    """Parametric heart polygon for HUD."""
+    pts: List[Tuple[int, int]] = []
+    s = size / 16.0
+    cx, cy = center
+    for i in range(samples):
+        t = (i / samples) * (2 * math.pi)
+        x = 16 * math.sin(t) ** 3
+        y = 13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t)
+        pts.append((int(cx + x * s), int(cy - y * s)))
+    return pts
+
+
+def rand_color() -> Color:
+    palette = [
+        (255, 99, 71),    # tomato
+        (255, 159, 64),   # orange
+        (255, 205, 86),   # yellow
+        (75, 192, 192),   # teal
+        (153, 102, 255),  # purple
+        (255, 99, 132),   # pink
+        (46, 204, 113),   # green
+    ]
+    return Color(*random.choice(palette))
+
+
+# -----------------------------
+# Visual bits
+# -----------------------------
+class BladeTrail:
+    """Stores recent mouse points with timestamps; renders taper + fade."""
+
+    def __init__(self) -> None:
+        self.points: Deque[Tuple[Vector2, float]] = deque(maxlen=MAX_TRAIL_POINTS)
+
+    def push(self, pos: Vector2, t: float) -> None:
+        self.points.append((Vector2(pos), t))
+
+    def prune(self, now: float) -> None:
+        while self.points and now - self.points[0][1] > TRAIL_KEEP_TIME:
+            self.points.popleft()
+
+    def draw(self, surf: Surface, now: float) -> None:
+        if len(self.points) < 2:
+            return
+        pts = list(self.points)
+        # Draw segments with fading alpha and width
+        for i in range(1, len(pts)):
+            (p0, t0), (p1, t1) = pts[i - 1], pts[i]
+            age = now - t1
+            fade = clamp(1.0 - age / TRAIL_KEEP_TIME, 0.0, 1.0)
+            if fade <= 0.0:
+                continue
+            width = max(1, int(SLICE_THICKNESS * fade))
+            col = (255, 255, 255, int(200 * fade))
+            pygame.draw.line(surf, col, p0, p1, width)
+
+
+# -----------------------------
+# Entities
+# -----------------------------
+@dataclass
+class Particle:
+    pos: Vector2
+    vel: Vector2
+    color: Color
+    life: float
+    age: float = 0.0
+
+    def update(self, dt: float) -> None:
+        # Drag reduces explosive spray over time (readability)
+        self.vel *= (1.0 - AIR_DRAG * dt * 60.0)
+        self.vel.y += GRAVITY * 0.2 * dt
+        self.pos += self.vel * dt
+        self.age += dt
+
+    def alive(self) -> bool:
+        return self.age < self.life
+
+    def draw(self, surf: Surface) -> None:
+        k = clamp(1.0 - self.age / self.life, 0.0, 1.0)
+        r = max(1, int(6 * k))
+        a = int(220 * (k ** 1.5))
+        pygame.draw.circle(surf, (*self.color[:3], a), self.pos, r)
+
+
+@dataclass
+class Fragment:
+    pos: Vector2
+    vel: Vector2
+    radius: float
+    color: Color
+    life: float = 0.8
+    age: float = 0.0
+    rot: float = field(default_factory=lambda: random.uniform(0, math.tau))
+    rot_vel: float = field(default_factory=lambda: random.uniform(-10.0, 10.0))
+
+    def update(self, dt: float) -> None:
+        self.vel *= (1.0 - AIR_DRAG * dt * 60.0)
+        self.vel.y += GRAVITY * dt
+        self.pos += self.vel * dt
+        self.rot += self.rot_vel * dt
+        self.age += dt
+
+    def alive(self) -> bool:
+        return self.age < self.life
+
+    def draw(self, surf: Surface) -> None:
+        # Render as a wedge to suggest a sliced half; cheap but effective.
+        k = clamp(1.0 - self.age / self.life, 0.0, 1.0)
+        r = int(self.radius)
+        a = int(255 * (k ** 1.2))
+        pts: List[Tuple[int, int]] = []
+        steps = 10
+        ang0 = self.rot
+        ang1 = self.rot + math.pi * 0.9
+        for i in range(steps + 1):
+            t = i / steps
+            ang = ang0 + t * (ang1 - ang0)
+            pts.append((int(self.pos.x + math.cos(ang) * r), int(self.pos.y + math.sin(ang) * r)))
+        pts.insert(0, (int(self.pos.x), int(self.pos.y)))
+        pygame.draw.polygon(surf, (*self.color[:3], a), pts)
+        pygame.draw.circle(surf, (*Color(240, 240, 240)[:3], a), self.pos, max(1, r // 4))
+
+
+@dataclass
+class Slicable:
+    pos: Vector2
+    vel: Vector2
+    radius: float
+    color: Color
+    kind: str  # 'fruit' or 'bomb'
+    alive: bool = True
+    sliced: bool = False
+
+    def update(self, dt: float) -> None:
+        self.vel *= (1.0 - AIR_DRAG * dt * 60.0)
+        self.vel.y += GRAVITY * dt
+        self.pos += self.vel * dt
+
+    def draw(self, surf: Surface) -> None:
+        if self.kind == 'bomb':
+            pygame.draw.circle(surf, Color(40, 40, 40), self.pos, int(self.radius))
+            pygame.draw.circle(surf, Color(200, 200, 200), self.pos + Vector2(-self.radius * 0.3, -self.radius * 0.3), max(2, int(self.radius * 0.14)))
+            fuse_end = self.pos + Vector2(self.radius * 0.5, -self.radius * 0.8)
+            pygame.draw.line(surf, Color(240, 220, 80), self.pos + Vector2(self.radius * 0.3, -self.radius * 0.6), fuse_end, 3)
+        else:
+            pygame.draw.circle(surf, self.color, self.pos, int(self.radius))
+            pygame.draw.circle(surf, Color(250, 250, 250), self.pos - Vector2(self.radius * 0.4, self.radius * 0.3), max(2, int(self.radius * 0.18)))
+
+
+# -----------------------------
+# Spawner
+# -----------------------------
+class Spawner:
+    def __init__(self) -> None:
+        self.timer = 0.0
+        self.target = random.uniform(*SPAWN_EVERY)
+
+    def update(self, dt: float, out: List[Slicable]) -> None:
+        self.timer += dt
+        if self.timer < self.target:
+            return
+        self.timer = 0.0
+        self.target = random.uniform(*SPAWN_EVERY)
+        count = random.randint(*FRUITS_PER_BURST)
+        for _ in range(count):
+            x = random.uniform(LAUNCH_X_MARGIN, WIDTH - LAUNCH_X_MARGIN)
+            y = HEIGHT + 30
+            speed = random.uniform(*FRUIT_SPEED)
+            ang = random.uniform(math.radians(100), math.radians(80))  # mostly upward
+            vx = math.cos(ang) * speed * random.choice([-1, 1]) * random.uniform(0.2, 0.6)
+            vy = -abs(math.sin(ang) * speed)
+            r = random.uniform(*FRUIT_RADIUS)
+            if random.random() < BOMB_CHANCE:
+                color = Color(50, 50, 50)
+                kind = 'bomb'
+            else:
+                color = rand_color()
+                kind = 'fruit'
+            out.append(Slicable(Vector2(x, y), Vector2(vx, vy), r, color, kind))
+
+
+# -----------------------------
+# Game
+# -----------------------------
+class Game:
+    def __init__(self, screen: Surface) -> None:
+        self.screen = screen
+        self.surf = Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        self.clock = pygame.time.Clock()
+        self.state = 'menu'
+        self.font_big = pygame.font.SysFont(None, 72)
+        self.font = pygame.font.SysFont(None, 32)
+        self.objects: List[Slicable] = []
+        self.fragments: List[Fragment] = []
+        self.particles: List[Particle] = []
+        self.spawner = Spawner()
+        self.trail = BladeTrail()
+        self.last_time = 0.0
+        self.score = 0
+        self.lives = LIVES_START
+        self.combo_count = 0
+        self.combo_timer = 0.0
+        self.swipe_active = False
+        self.swipe_sliced_ids: set[int] = set()
+        self.shake = 0.0
+        self.bg = self._make_bg()
+
+    def _make_bg(self) -> Surface:
+        # Soft vertical gradient for focus
+        bg = Surface((WIDTH, HEIGHT))
+        for y in range(HEIGHT):
+            t = y / HEIGHT
+            c = [int(22 + 18 * (1 - t)), int(28 + 28 * (1 - t)), int(36 + 40 * t)]
+            pygame.draw.line(bg, c, (0, y), (WIDTH, y))
+        return bg.convert()
+
+    def reset(self) -> None:
+        self.objects.clear()
+        self.fragments.clear()
+        self.particles.clear()
+        self.spawner = Spawner()
+        self.trail = BladeTrail()
+        self.score = 0
+        self.lives = LIVES_START
+        self.combo_count = 0
+        self.combo_timer = 0.0
+        self.swipe_active = False
+        self.swipe_sliced_ids.clear()
+        self.shake = 0.0
+        self.state = 'play'
+
+    # -------------------------
+    # Main loop
+    # -------------------------
+    def run(self) -> None:
+        t = 0.0
+        while True:
+            dt_ms = self.clock.tick(FPS)
+            dt = dt_ms / 1000.0
+            t += dt
+            if not self.handle_events(t):
+                return
+            if self.state == 'play':
+                self.update(dt, t)
+            self.draw(t)
+
+    # -------------------------
+    # Logic
+    # -------------------------
+    def handle_events(self, now: float) -> bool:
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                return False
+            if e.type == pygame.KEYDOWN:
+                if e.key == pygame.K_ESCAPE:
+                    return False
+                if e.key == pygame.K_p:
+                    if self.state == 'play':
+                        self.state = 'paused'
+                    elif self.state == 'paused':
+                        self.state = 'play'
+                if e.key == pygame.K_r and self.state == 'gameover':
+                    self.reset()
+                if e.key == pygame.K_SPACE and self.state == 'menu':
+                    self.reset()
+            if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+                self.swipe_active = True
+                self.swipe_sliced_ids.clear()
+            if e.type == pygame.MOUSEBUTTONUP and e.button == 1:
+                self.finish_swipe()
+        # Update trail regardless of state for responsiveness
+        mx, my = pygame.mouse.get_pos()
+        self.trail.push(Vector2(mx, my), now)
+        self.trail.prune(now)
+        return True
+
+    def finish_swipe(self) -> None:
+        if self.combo_count >= 2:
+            self.shake = min(20.0, self.shake + 6.0 + self.combo_count)
+        self.combo_count = 0
+        self.combo_timer = 0.0
+        self.swipe_active = False
+        self.swipe_sliced_ids.clear()
+
+    def update(self, dt: float, now: float) -> None:
+        # Spawning
+        self.spawner.update(dt, self.objects)
+
+        # Objects
+        for o in self.objects:
+            o.update(dt)
+        for f in self.fragments:
+            f.update(dt)
+        for p in self.particles:
+            p.update(dt)
+
+        # Cull
+        self.fragments = [f for f in self.fragments if f.alive() and -120 <= f.pos.x <= WIDTH + 120 and f.pos.y <= HEIGHT + 200]
+        self.particles = [p for p in self.particles if p.alive()]
+
+        # Missed fruits
+        for o in self.objects:
+            if o.alive and not o.sliced and o.kind == 'fruit' and o.pos.y - o.radius > HEIGHT + 10:
+                o.alive = False
+                self.lives -= 1
+                self.shake = min(18.0, self.shake + 4.0)
+        self.objects = [o for o in self.objects if o.alive and o.pos.y - o.radius <= HEIGHT + 200]
+
+        # Slicing
+        if self.swipe_active:
+            self.apply_slices(now, dt)
+
+        # Combo timer
+        if self.combo_count > 0:
+            self.combo_timer += dt
+            if self.combo_timer > COMBO_WINDOW_RESET:
+                self.finish_swipe()
+
+        # Game over
+        if self.lives <= 0:
+            self.state = 'gameover'
+
+        # Shake decay
+        self.shake = max(0.0, self.shake - SHAKE_DECAY * dt)
+
+    def apply_slices(self, now: float, dt: float) -> None:
+        pts = list(self.trail.points)
+        if len(pts) < 2:
+            return
+        # Check recent segment speed for intent; use last two points
+        (p0, t0), (p1, t1) = pts[-2], pts[-1]
+        dtp = max(1e-3, t1 - t0)
+        speed = (p1 - p0).length() / dtp
+        if speed < SLICE_MIN_SPEED:
+            return
+        # Iterate segments in the trail for thick swipes
+        sliced_this_frame: List[Tuple[int, Slicable, Vector2]] = []
+        for i in range(1, len(pts)):
+            a, _ = pts[i - 1]
+            b, _ = pts[i]
+            for idx, obj in enumerate(self.objects):
+                if not obj.alive or obj.sliced:
+                    continue
+                if line_segment_circle_intersect(a, b, obj.pos, obj.radius):
+                    sliced_this_frame.append((idx, obj, (b - a).normalize() if (b - a).length_squared() > 1e-6 else Vector2(1, 0)))
+        if not sliced_this_frame:
+            return
+        # Resolve unique hits per object per swipe
+        hit_indices: set[int] = set()
+        for idx, obj, dirv in sliced_this_frame:
+            if idx in hit_indices:
+                continue
+            hit_indices.add(idx)
+            self.on_slice(obj, dirv)
+
+    def on_slice(self, obj: Slicable, dirv: Vector2) -> None:
+        obj.sliced = True
+        obj.alive = False
+        if obj.kind == 'bomb':
+            # Instant game over feedback
+            self.fragments.clear()
+            self.particles.clear()
+            self.shake = 28.0
+            self.state = 'gameover'
+            return
+        # Fruit sliced
+        self.score += 1
+        self.combo_count += 1
+        self.combo_timer = 0.0
+        self.shake = min(22.0, self.shake + 2.5)
+
+        # Fragments split along normal to swipe dir
+        normal = Vector2(-dirv.y, dirv.x)
+        frag_speed = 300.0 + obj.radius * 5
+        for sgn in (-1, 1):
+            fvel = obj.vel + normal * (sgn * frag_speed) + dirv * 60.0
+            self.fragments.append(
+                Fragment(Vector2(obj.pos), fvel, obj.radius * 0.75, obj.color, life=0.9)
+            )
+        # Particles (juice)
+        count = random.randint(*PARTICLES_PER_SLICE)
+        for _ in range(count):
+            spread = (random.random() ** 0.35) * 380 + 60
+            ang = math.atan2(dirv.y, dirv.x) + random.uniform(-0.9, 0.9)
+            vel = Vector2(math.cos(ang), math.sin(ang)) * spread
+            base = Color(obj.color)
+            juicy = Color(clamp(base.r + 20, 0, 255), clamp(base.g + 20, 0, 255), clamp(base.b + 20, 0, 255))
+            self.particles.append(Particle(Vector2(obj.pos), vel, juicy, life=random.uniform(0.35, 0.75)))
+
+    # -------------------------
+    # Render
+    # -------------------------
+    def draw(self, now: float) -> None:
+        # Background
+        self.screen.blit(self.bg, (0, 0))
+        # Camera shake
+        ox = random.uniform(-1, 1) * self.shake
+        oy = random.uniform(-1, 1) * self.shake
+        origin = (ox, oy)
+        self.surf.fill((0, 0, 0, 0))
+
+        # Entities
+        for f in self.fragments:
+            f.draw(self.surf)
+        for p in self.particles:
+            p.draw(self.surf)
+        for o in self.objects:
+            o.draw(self.surf)
+
+        # Blade
+        self.trail.draw(self.surf, now)
+
+        # HUD
+        self.draw_hud()
+
+        # Compose
+        self.screen.blit(self.surf, origin)
+
+        # Overlays
+        if self.state in ('menu', 'paused', 'gameover'):
+            self.draw_overlay()
+
+        pygame.display.flip()
+
+    def draw_hud(self) -> None:
+        # Score
+        txt = self.font.render(f"Score: {self.score}", True, (245, 245, 245))
+        self.surf.blit(txt, (16, 14))
+        # Lives
+        for i in range(self.lives):
+            cx = WIDTH - 28 - i * 34
+            cy = 28
+            pygame.draw.polygon(self.surf, (220, 60, 80), poly_heart(Vector2(cx, cy), 20))
+
+        # Combo flash text
+        if self.combo_count >= 2 and self.state == 'play':
+            msg = f"Combo x{self.combo_count}!"
+            alpha = 160
+            surf = self.font.render(msg, True, (255, 235, 120))
+            shadow = self.font.render(msg, True, (0, 0, 0))
+            pos = (WIDTH // 2 - surf.get_width() // 2, 60)
+            shadow.set_alpha(alpha)
+            surf.set_alpha(alpha)
+            self.surf.blit(shadow, (pos[0] + 2, pos[1] + 2))
+            self.surf.blit(surf, pos)
+
+    def draw_overlay(self) -> None:
+        overlay = Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill((10, 12, 16, 140))
+        self.screen.blit(overlay, (0, 0))
+        title = "Fruit Slash"
+        if self.state == 'paused':
+            subtitle = "Paused — Press P to resume"
+        elif self.state == 'gameover':
+            subtitle = f"Game Over — Score {self.score} | Press R to restart"
+        else:
+            subtitle = "Press Space to play — Hold LMB to slice; avoid bombs"
+        t1 = self.font_big.render(title, True, (255, 255, 255))
+        t2 = self.font.render(subtitle, True, (235, 235, 235))
+        self.screen.blit(t1, (WIDTH // 2 - t1.get_width() // 2, HEIGHT // 2 - 60))
+        self.screen.blit(t2, (WIDTH // 2 - t2.get_width() // 2, HEIGHT // 2 + 8))
+
+
+# -----------------------------
+# Entrypoint
+# -----------------------------
+
+def main() -> None:
+    pygame.init()
+    pygame.display.set_caption("Fruit Slash")
+    flags = pygame.SCALED | pygame.RESIZABLE | pygame.DOUBLEBUF
+    screen = pygame.display.set_mode((WIDTH, HEIGHT), flags)
+    try:
+        Game(screen).run()
+    finally:
+        pygame.quit()
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
