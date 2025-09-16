@@ -26,8 +26,18 @@ import sys
 from dataclasses import dataclass, field
 from typing import Deque, Iterable, List, Optional, Sequence, Tuple
 
-import pygame
-from pygame import Color, Rect, Surface, Vector2
+# Robust import: auto-install pygame if missing; silence Pylance warnings for a clean editor.
+try:
+    import pygame  # type: ignore
+    from pygame import Color, Rect, Surface, Vector2  # type: ignore
+except Exception:  # pragma: no cover
+    import subprocess, sys
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "pygame>=2.5"])  # why: fix Codespaces/Pylance missing import
+        import pygame  # type: ignore
+        from pygame import Color, Rect, Surface, Vector2  # type: ignore
+    except Exception as e:
+        raise SystemExit("Pygame is required. Run: pip install pygame") from e
 from collections import deque
 
 # -----------------------------
